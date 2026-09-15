@@ -128,6 +128,56 @@ class BatchReviewRequest(BaseModel):
     )
 
 
+class StrengthAnalysisRequest(BaseModel):
+    """Kubelka-Munk dye-strength analysis of a target/sample pair.
+
+    The analysis scope is selected by ``analysis_band_nm`` *or*
+    ``primary_wavelength_nm`` (mutually exclusive); with neither, the
+    target's main absorption region is located automatically.
+    """
+
+    target: SpectrumInput
+    sample: SpectrumInput
+    illuminants: list[IlluminantSpec] = Field(
+        default_factory=lambda: [
+            IlluminantSpec(name="D65"),
+            IlluminantSpec(name="A"),
+            IlluminantSpec(name="F11"),
+        ],
+        min_length=1,
+        max_length=8,
+    )
+    primary_wavelength_nm: float | None = Field(
+        None, ge=380.0, le=780.0,
+        description=(
+            "Evaluate the K/S strength ratio at this wavelength; omit to "
+            "auto-locate the target's main absorption region."
+        ),
+    )
+    analysis_band_nm: list[float] | None = Field(
+        None, min_length=2, max_length=2,
+        description=(
+            "Optional [lo, hi] analysis band (nm) for the strength fit; "
+            "mutually exclusive with primary_wavelength_nm."
+        ),
+    )
+    strength_tolerance: float = Field(
+        0.05, gt=0, le=1.0,
+        description=(
+            "Relative tolerance on the composite (visible-integrated) "
+            "strength ratio; |ratio - 1| within it counts as on-strength."
+        ),
+    )
+    residual_tolerance_de00: float = Field(
+        1.0, gt=0, le=50.0,
+        description=(
+            "Maximum residual Delta E00 allowed after the sample K/S has "
+            "been rescaled to the target strength."
+        ),
+    )
+    grid_step_nm: float = Field(10.0, ge=5, le=20)
+
+
 class ValidationIssue(BaseModel):
     field: str
     code: str

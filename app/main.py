@@ -7,6 +7,7 @@ GET  /illuminants                 built-in illuminant catalogue
 POST /api/v1/review               single target/sample pair, many illuminants
 POST /api/v1/review/batch         one target, many samples; filter + sort
 POST /api/v1/review/uncertainty   repeat-scan bootstrap of Delta E00 uncertainty
+POST /api/v1/review/strength      Kubelka-Munk K/S dye-strength split
 """
 from __future__ import annotations
 
@@ -20,8 +21,10 @@ from .engine import evaluate_pair, evaluate_uncertainty, resolve_illuminants
 from .schemas import (
     BatchReviewRequest,
     ReviewRequest,
+    StrengthAnalysisRequest,
     UncertaintyReviewRequest,
 )
+from .strength import evaluate_strength
 from .validation import (
     RequestValidationError,
     parse_spectrum,
@@ -197,6 +200,50 @@ async def review_uncertainty(req: UncertaintyReviewRequest):
         draws=req.draws,
         prob_bound=req.critical_probability_bound,
     )
+
+
+@app.post("/api/v1/review/strength")
+async def review_strength(req: StrengthAnalysisRequest):
+    target, sample, illuminants = _parse_pair(req)
+
+    issues: list[dict] = []
+    band = None
+    if req.analysis_band_nm is not None:
+        lo, hi = (float(v) for v in req.analysis_band_nm)
+        if req.primary_wavelength_nm is not None:
+            issues.append({
+                "field": "analysis_band_nm",
+                "code": "analysis_scope_ambiguous",
+                "reason": (
+                    "provide either 'analysis_band_nm' or "
+                    "'primary_wavelength_nm', not both"
+                ),
+            })
+        elif not lo < hi:
+            issues.append({
+                "field": "analysis_band_nm",
+                "code": "band_not_increasing",
+                "reason": f"analysis band must satisfy lo < hi, got [{lo:g}, {hi:g}]",
+            })
+        else:
+            band = (lo, hi)
+    if issues:
+        raise RequestValidationError(issues)
+
+    result = evaluate_strength(
+        target, sample, illuminants,
+        step_nm=req.grid_step_nm,
+        primary_wavelength_nm=req.primary_wavelength_nm,
+        analysis_band_nm=band,
+        strength_tolerance=req.strength_tolerance,
+        residual_tolerance_de00=req.residual_tolerance_de00,
+    )
+    return {
+        "grid_step_nm": req.grid_step_nm,
+        "strength_tolerance": req.strength_tolerance,
+        "residual_tolerance_de00": req.residual_tolerance_de00,
+        **result,
+    }
 
 
 @app.post("/api/v1/review/batch")

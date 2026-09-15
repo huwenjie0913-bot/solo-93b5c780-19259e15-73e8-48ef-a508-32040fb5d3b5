@@ -14,7 +14,10 @@
 6. 批量接口对多个试样**按阈值筛选、排序候选**；
 7. `/review/uncertainty` 接收目标样/试样各 2–50 条**重复扫描**，用可复现的
    自助法（bootstrap）蒙特卡洛给出 ΔE00 的中位数、2.5%/97.5% 分位数、
-   超阈概率，并判定“稳定合格 / 临界 / 稳定超差”。
+   超阈概率，并判定“稳定合格 / 临界 / 稳定超差”；
+8. `/review/strength` 用 **Kubelka–Munk K/S** 把综合色差拆成**上染深浅**
+   （色力比）与**色相/配方**（校正后残余 ΔE00）两类偏差，给出
+   “偏浅 / 偏深 / 配方失配 / 匹配”结论。
 
 ## 色度学口径
 
@@ -61,6 +64,7 @@ python3 -m venv .venv
 | POST | `/api/v1/review` | 单对目标样/试样，多光源复核 |
 | POST | `/api/v1/review/batch` | 一个目标样 + 多个试样，筛选/排序 |
 | POST | `/api/v1/review/uncertainty` | 重复扫描自助法：ΔE00 分布、超阈概率、稳定/临界判定 |
+| POST | `/api/v1/review/strength` | Kubelka–Munk 色力分析：深浅 vs 配方失配拆分 |
 
 ### 请求体关键字段
 
@@ -190,6 +194,67 @@ curl -s http://127.0.0.1:8000/api/v1/review/uncertainty \
 “最不稳定光源”取 95% 区间宽度最大的光源；分块计算保证
 `draws=200000` 时内存占用仍有上界（约数十 MB）。
 
+### 染色色力分析：`/api/v1/review/strength`
+
+染色样与标准样出现综合色差时，先要分清是**上染深浅**（浓度问题，调
+用量即可）还是**染料配比改变了色相**（必须改配方）。本接口基于
+Kubelka–Munk 理论把两类偏差拆开：
+
+1. 对目标样/试样反射率逐波长计算 **K/S = (1−R)²/(2R)**；
+2. 报告三级**色力比**（试样 ÷ 目标）：主吸收波长处、分析波段积分、
+   可见区积分（**综合色力比**，用于深浅判定）；
+3. 求把试样 K/S 调整到目标强度的**非负最小二乘缩放系数** α
+   （min ‖α·K/S_试样 − K/S_目标‖²，α ≥ 0），并将 α·K/S 反算为
+   **校正反射率光谱** R = 1 + K/S − √((K/S)² + 2K/S)；
+4. 在每个所选光源下返回调整前后的 Lab 与 ΔE00（`delta_e00_before` /
+   `delta_e00_after`），残余 ΔE00 取各光源最差值。
+
+分析范围三选一：
+
+- `analysis_band_nm: [lo, hi]`：指定分析波段（自动裁剪到共同波长支撑，
+  主吸收波长取波段内目标 K/S 峰）；
+- `primary_wavelength_nm`：指定主吸收波长（单点色力比与缩放系数）；
+- 两者都不给：**自动定位**目标样主吸收区（K/S 峰的半高宽连续区域），
+  并报告主吸收波长。两者同时给或波段 lo ≥ hi 返回 422。
+
+判定规则（`strength_tolerance` 为综合色力相对容差，默认 0.05；
+`residual_tolerance_de00` 为残余 ΔE00 容差，默认 1.0）：
+
+| `verdict` | 条件 | 含义 |
+|-----------|------|------|
+| `too_light`（偏浅） | 综合色力比 < 1 − 容差 | 色力不足，提高染料浓度 |
+| `too_dark`（偏深） | 综合色力比 > 1 + 容差 | 色力过高，降低染料浓度 |
+| `recipe_mismatch`（配方失配） | 色力合格但残余 ΔE00 超差 | 色相本身不符，需改配方 |
+| `match` | 两者均合格 | 深浅与色相都在容差内 |
+
+```bash
+curl -s http://127.0.0.1:8000/api/v1/review/strength \
+  -H 'Content-Type: application/json' \
+  -d @examples/strength_request.json | python3 -m json.tool
+```
+
+响应摘要（示例为色力 ×1.25 的同配方试样）：
+
+```jsonc
+{
+  "primary_wavelength_nm": 470.0,
+  "primary_wavelength_source": "auto",
+  "analysis_band_nm": [380.0, 540.0],
+  "strength": {"ratio_at_wavelength": 1.25, "ratio_band": 1.25,
+               "ratio_integrated": 1.25, "scale_factor": 0.8,
+               "tolerance": 0.05, "within_tolerance": false},
+  "results_by_illuminant": [
+    {"illuminant": "D65", "delta_e00_before": 2.64, "delta_e00_after": 0.0,
+     "lab_target": {...}, "lab_sample": {...}, "lab_corrected": {...}}
+  ],
+  "residual_de00_max": 0.0,
+  "verdict": "too_dark"
+}
+```
+
+`corrected_reflectance` 为校正后光谱；同配方纯深浅偏差时
+`delta_e00_after` ≈ 0，而配方失配时即使色力调准，残余 ΔE00 仍然显著。
+
 ## 错误处理（HTTP 422）
 
 所有数据问题一次性收集返回，每条错误都带 `field` / `code` / `reason`，
@@ -211,6 +276,12 @@ curl -s http://127.0.0.1:8000/api/v1/review/uncertainty \
 | `illuminant_ambiguous` | 同时/均未提供 `name` 与 `custom` | — |
 | `duplicate_illuminant` | 光源重复 | — |
 | `invalid_grid_step` / `invalid_wavelength_range` / `range_step_mismatch` | 网格参数非法 | `value`/`allowed_range` |
+| `near_zero_reflectance` | 反射率 < 1e-3，K/S 变换无意义（仅色力分析） | `violations`（波长+值）、`floor` |
+| `no_common_band` | 分析波段与共同波长支撑无交点 | `band_nm`/`grid_range_nm` |
+| `wavelength_out_of_support` | 指定主吸收波长超出共同支撑 | `grid_range_nm` |
+| `no_absorption` | 目标样 K/S 在可见区/分析波段/指定波长处为零（无吸收，色力比无定义） | — |
+| `undefined_scaling` | 试样在分析波段内 K/S 全零，无法求解缩放系数 | — |
+| `analysis_scope_ambiguous` / `band_not_increasing` | 同时给定波段与主吸收波长 / 波段 lo ≥ hi | — |
 
 ## 目录结构
 
@@ -219,10 +290,11 @@ app/
   colorimetry.py     # CMF/SPD 数据、插值、XYZ、Lab、CIEDE2000
   validation.py      # 带字段定位的输入校验
   engine.py          # 网格对齐、逐光源计算、同色异谱判定、波段归因
+  strength.py        # Kubelka–Munk K/S 色力拆分与校正光谱
   schemas.py         # Pydantic 请求/响应模型
   main.py            # FastAPI 路由与 422 归一化
   data/              # 打包的 CIE 1931 CMF 与 A/D65/F11 SPD（离线）
 scripts/build_data.py
-tests/               # CIEDE2000 标准数据 + 单元/接口/对拍/不确定性测试
-examples/            # curl 示例请求（含 uncertainty_request.json）
+tests/               # CIEDE2000 标准数据 + 单元/接口/对拍/不确定性/色力测试
+examples/            # curl 示例请求（含 uncertainty_request.json、strength_request.json）
 ```
