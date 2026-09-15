@@ -1,0 +1,5 @@
+-r requirements.txt
+pytest>=8.0
+httpx>=0.27
+# optional independent oracle used by tests/test_colour_oracle.py (auto-skips if absent)
+colour-science>=0.4.4

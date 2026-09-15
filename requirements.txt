@@ -1,0 +1,5 @@
+fastapi>=0.110
+uvicorn>=0.29
+numpy>=1.24
+# pydantic comes transitively via fastapi; pin a modern v2 explicitly
+pydantic>=2.5

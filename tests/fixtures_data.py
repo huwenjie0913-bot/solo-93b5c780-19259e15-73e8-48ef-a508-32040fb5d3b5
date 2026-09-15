@@ -1,0 +1,37 @@
+"""Shared test fixtures: a synthetic but genuine metameric pair.
+
+The two reflectance curves share XYZ (Delta E00 ~ 0) under D65 but separate
+under illuminant A (Delta E00 ~ 3.2) and F11 (~1.0). The pair was obtained by
+minimum-norm matching of narrow-band basis functions to a smooth target under
+D65 (see conversation history / scripts), and is cross-validated against
+colour-science's spectral integration pipeline.
+"""
+WL_10NM = [380 + 10 * i for i in range(41)]
+
+TARGET = [
+    0.18068, 0.1799, 0.17865, 0.17685, 0.17449, 0.17169, 0.16868, 0.16587,
+    0.16385, 0.1633, 0.16498, 0.16961, 0.17777, 0.18985, 0.20599, 0.22607,
+    0.24972, 0.27638, 0.30533, 0.33575, 0.36673, 0.39736, 0.42669, 0.45385,
+    0.47804, 0.49859, 0.51505, 0.52716, 0.53495, 0.53868, 0.53884, 0.53608,
+    0.53116, 0.52483, 0.51784, 0.51078, 0.50413, 0.49823, 0.49323, 0.4892,
+    0.48608,
+]
+
+# Metamer: matches target under D65 (dE00 ~ 0), diverges under A.
+METAMER = [
+    0.22497, 0.22405, 0.22092, 0.21427, 0.20432, 0.1921, 0.17919, 0.16735,
+    0.15801, 0.15205, 0.14862, 0.14706, 0.1479, 0.15336, 0.16689, 0.19199,
+    0.22905, 0.27668, 0.33049, 0.38465, 0.43238, 0.46644, 0.48205, 0.47597,
+    0.45123, 0.4129, 0.36943, 0.32828, 0.29388, 0.26817, 0.25047, 0.23927,
+    0.23264, 0.22898, 0.22706, 0.22609, 0.22561, 0.22537, 0.22526, 0.2252,
+    0.22517,
+]
+
+DEFAULT_ILLUMINANTS = [{"name": "D65"}, {"name": "A"}, {"name": "F11"}]
+
+
+def spectrum(values, wavelengths=None):
+    return {
+        "wavelengths": wavelengths or WL_10NM,
+        "values": values,
+    }
