@@ -1,3 +1,5 @@
+import math
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -12,6 +14,20 @@ from tests.fixtures_data import (
 )
 
 client = TestClient(app)
+
+
+def _neutral_dark_de00_reference(r_target, r_sample):
+    """Independent CIEDE2000 oracle for two flat dark reflectors.
+
+    Both colours are neutral (a*=b*=0) with XYZ = r * white XYZ and
+    r below the Lab linear-branch threshold, so L* = kappa*r for the
+    D65-adapted value and dE00 = |dL*| / S_L."""
+    kappa = 24389.0 / 27.0
+    l1, l2 = kappa * r_target, kappa * r_sample
+    l_bar = 0.5 * (l1 + l2)
+    s_l = 1.0 + 0.015 * (l_bar - 50.0) ** 2 / math.sqrt(
+        20.0 + (l_bar - 50.0) ** 2)
+    return abs(l2 - l1) / s_l
 
 
 def review_payload(target=TARGET, sample=METAMER, **kw):
@@ -187,3 +203,45 @@ def test_batch_mean_sort_and_name_sort():
                "tolerance_de00": 2.0, "sort_by": "name"}
     body = client.post("/api/v1/review/batch", json=payload).json()
     assert [c["name"] for c in body["candidates"]] == ["alpha", "zeta"]
+
+
+def test_single_review_dark_neutral_pair_uses_correct_linear_branch():
+    """Regression for the (kappa*t+16)/116 low-branch slip: dark non-black
+    samples must get the correct L* (broken formula inflated it by ~13)."""
+    r_t, r_s = 0.004, 0.006
+    payload = review_payload(
+        target=[r_t] * len(WL_10NM), sample=[r_s] * len(WL_10NM),
+        illuminants=[{"name": "D65"}],
+        tolerance_de00=50.0)
+    body = client.post("/api/v1/review", json=payload).json()
+    item = body["results_by_illuminant"][0]
+    kappa = 24389.0 / 27.0
+    assert item["lab_target"]["L"] == pytest.approx(kappa * r_t, abs=5e-5)
+    assert item["lab_sample"]["L"] == pytest.approx(kappa * r_s, abs=5e-5)
+    assert abs(item["lab_target"]["a"]) < 1e-4
+    assert abs(item["lab_target"]["b"]) < 1e-4
+    expected_de = _neutral_dark_de00_reference(r_t, r_s)
+    assert item["delta_e00"] == pytest.approx(expected_de, abs=1e-4)
+
+
+def test_batch_review_dark_non_neutral_pair_correct():
+    # non-neutral dark pair exercises the x/z low-value branches too;
+    # compare against the single-review numbers on the same pair
+    r_t = [0.01 * v for v in TARGET]
+    r_s = [0.01 * v for v in METAMER]
+    single = client.post("/api/v1/review", json=review_payload(
+        target=r_t, sample=r_s, illuminants=[{"name": "A"}])).json()
+    batch = client.post("/api/v1/review/batch", json={
+        "target": spectrum(r_t),
+        "samples": [{"name": "dark", **spectrum(r_s)}],
+        "illuminants": [{"name": "A"}],
+        "tolerance_de00": 2.0,
+    }).json()
+    cand = batch["candidates"][0]
+    single_item = single["results_by_illuminant"][0]
+    assert cand["max_de00"] == pytest.approx(
+        single_item["delta_e00"], abs=1e-9)
+    # a genuinely dark pair: both L* well inside the linear branch (< eps)
+    assert single_item["lab_target"]["L"] < 12
+    assert single_item["lab_sample"]["L"] < 12
+    assert single_item["delta_e00"] > 0.1

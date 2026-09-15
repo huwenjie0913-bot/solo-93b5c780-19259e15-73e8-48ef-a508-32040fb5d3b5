@@ -137,7 +137,7 @@ def _f_lab(t):
     eps = 216.0 / 24389.0
     kappa = 24389.0 / 27.0
     t = np.asarray(t, dtype=float)
-    linear = kappa * t + 16.0 / 116.0
+    linear = (kappa * t + 16.0) / 116.0
     cube = np.cbrt(np.maximum(t, 0.0))
     return np.where(t > eps, cube, linear)
 

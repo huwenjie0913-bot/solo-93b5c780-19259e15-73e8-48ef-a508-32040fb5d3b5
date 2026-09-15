@@ -157,23 +157,28 @@ curl -s http://127.0.0.1:8000/api/v1/review/uncertainty \
 
 响应逐光源返回 `median_de00`、`q025_de00`、`q975_de00`、
 `ci95_width_de00`、`probability_over_tolerance`、`classification` 与
-`effective_draws`（实际抽到的不同“目标扫描内容×试样扫描内容”配对数；
-提交完全相同的重复扫描时该数会下降）。`summary` 汇总：
+`effective_draws`（该光源实际参与分位数与超阈概率计算的有效（有限）
+ΔE00 样本数；`replicates.possible_pairs` 另报目标×试样扫描的配对组合数）。
+`summary` 汇总：
 
 ```jsonc
 {
   "replicates": {"target_scans": 6, "sample_scans": 5,
-                 "possible_pairs": 30, "unique_pairs_sampled": 30},
+                 "possible_pairs": 30},
   "results_by_illuminant": [
     {"illuminant": "D65", "median_de00": 0.6381,
      "q025_de00": 0.1158, "q975_de00": 1.6191,
-     "probability_over_tolerance": 0.2372, "classification": "critical", ...},
+     "probability_over_tolerance": 0.2372,
+     "classification": "critical", "effective_draws": 5000, ...},
     {"illuminant": "A",   "median_de00": 2.8675,
-     "probability_over_tolerance": 1.0, "classification": "stable_fail", ...},
+     "probability_over_tolerance": 1.0,
+     "classification": "stable_fail", "effective_draws": 5000, ...},
     {"illuminant": "F11", "median_de00": 1.4333,
-     "probability_over_tolerance": 0.8972, "classification": "critical", ...}
+     "probability_over_tolerance": 0.8972,
+     "classification": "critical", "effective_draws": 5000, ...}
   ],
   "summary": {
+    "effective_draws": 5000,
     "probability_over_tolerance_any_illuminant": 1.0,
     "classification_any": "stable_fail",
     "least_stable_illuminant": "F11",

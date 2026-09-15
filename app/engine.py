@@ -383,14 +383,6 @@ def evaluate_uncertainty(target_scans: list[Spectrum],
     rng = np.random.default_rng(seed)
     idx_t = rng.integers(0, n_target, size=draws)
     idx_s = rng.integers(0, n_sample, size=draws)
-    # Effective number of distinct bootstrap outcomes actually drawn: collapse
-    # scan indices that carry the same aligned reflectance (e.g. submitted
-    # duplicate scans), then count distinct (target, sample) content pairs.
-    _, content_t = np.unique(r_target, axis=0, return_inverse=True)
-    _, content_s = np.unique(r_sample, axis=0, return_inverse=True)
-    pair_codes = content_t[idx_t].astype(np.int64) * (n_sample + 1) \
-        + content_s[idx_s]
-    effective_draws = int(np.unique(pair_codes).size)
 
     x_bar, y_bar, z_bar = cmf_on_grid(grid)
     w = _trapz_weights(grid)
@@ -429,6 +421,7 @@ def evaluate_uncertainty(target_scans: list[Spectrum],
 
     de_by_ill = [np.empty(draws, dtype=float) for _ in illuminants]
     any_over = np.zeros(draws, dtype=bool)
+    any_valid = np.zeros(draws, dtype=bool)
 
     for start in range(0, draws, chunk_size):
         stop = min(start + chunk_size, draws)
@@ -444,13 +437,30 @@ def evaluate_uncertainty(target_scans: list[Spectrum],
             lab_s = xyz_to_lab_array(xyz_s, white)
             de_chunk = ciede2000_array(lab_t, lab_s)
             de_by_ill[j][start:stop] = de_chunk
+            finite_chunk = np.isfinite(de_chunk)
+            any_valid[start:stop] |= finite_chunk
             any_over[start:stop] |= de_chunk > tolerance + 1e-9
 
     per_ill: list[dict] = []
     for ill, de in zip(illuminants, de_by_ill):
+        # effective_draws = number of draws that actually produced a finite
+        # Delta E00 and therefore fed this illuminant's quantiles/probability
+        valid = np.isfinite(de)
+        n_effective = int(np.count_nonzero(valid))
+        if n_effective == 0:
+            raise RequestValidationError([{
+                "field": f"illuminants:{ill.key}",
+                "code": "no_effective_draws",
+                "reason": (
+                    f"no finite Delta E00 sample was produced for illuminant "
+                    f"{ill.display_name!r}; cannot estimate uncertainty"
+                ),
+            }])
+        de_valid = de[valid]
         q025, median, q975 = (float(v) for v in np.quantile(
-            de, (0.025, 0.5, 0.975), method="linear"))
-        prob_over = float(np.count_nonzero(de > tolerance + 1e-9)) / draws
+            de_valid, (0.025, 0.5, 0.975), method="linear"))
+        prob_over = float(np.count_nonzero(
+            de_valid > tolerance + 1e-9)) / n_effective
         q025_r, median_r, q975_r = (round(v, 4) for v in (q025, median, q975))
 
         per_ill.append({
@@ -463,14 +473,16 @@ def evaluate_uncertainty(target_scans: list[Spectrum],
             "ci95_width_de00": round(q975_r - q025_r, 4),
             "probability_over_tolerance": round(prob_over, 6),
             "classification": _classify(prob_over, prob_bound),
-            "effective_draws": effective_draws,
+            "effective_draws": n_effective,
             "tolerance_de00": tolerance,
         })
 
     # The least stable light: widest Monte Carlo 95% interval (first wins ties).
     least = max(range(len(per_ill)),
                 key=lambda i: per_ill[i]["ci95_width_de00"])
-    prob_any_over = float(np.count_nonzero(any_over)) / draws
+    n_any_valid = int(np.count_nonzero(any_valid))
+    prob_any_over = (float(np.count_nonzero(any_over & any_valid))
+                     / n_any_valid if n_any_valid else 0.0)
 
     return {
         "grid_nm": list(grid),
@@ -483,10 +495,10 @@ def evaluate_uncertainty(target_scans: list[Spectrum],
             "target_scans": n_target,
             "sample_scans": n_sample,
             "possible_pairs": n_target * n_sample,
-            "unique_pairs_sampled": effective_draws,
         },
         "results_by_illuminant": per_ill,
         "summary": {
+            "effective_draws": n_any_valid,
             "probability_over_tolerance_any_illuminant": round(prob_any_over, 6),
             "classification_any": _classify(prob_any_over, prob_bound),
             "least_stable_illuminant": per_ill[least]["illuminant"],

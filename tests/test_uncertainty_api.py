@@ -69,10 +69,13 @@ def test_basic_response_shape_and_ordering():
         assert {"illuminant", "illuminant_label", "kind"} <= set(item)
     rep = body["replicates"]
     assert rep == {
-        "target_scans": 6, "sample_scans": 6,
-        "possible_pairs": 36, "unique_pairs_sampled": rep["unique_pairs_sampled"],
+        "target_scans": 6, "sample_scans": 6, "possible_pairs": 36,
     }
-    assert rep["unique_pairs_sampled"] <= 36
+    # effective_draws counts the finite Delta E00 samples that actually fed
+    # the quantiles/probability for each illuminant, not distinct pairings
+    for item in body["results_by_illuminant"]:
+        assert item["effective_draws"] == body["draws"]
+    assert body["summary"]["effective_draws"] == body["draws"]
     assert body["seed"] == 1234 and body["draws"] == 3000
     assert body["critical_probability_bound"] == 0.05
 
@@ -148,10 +151,11 @@ def test_draws_control_resolution():
     assert body["draws"] == 1000
 
 
-def test_identical_repeats_give_zero_with_positive_width_support():
+def test_identical_repeats_give_zero_distribution():
     # Exactly identical repeat scans: every bootstrap draw is the same pair,
-    # so the Delta E00 distribution collapses to the deterministic single
-    # review value (0 for identical curves) with effective_draws == 1.
+    # so the Delta E00 distribution collapses to zero for identical curves.
+    # effective_draws must still equal the requested number of draws, because
+    # every draw produced a finite Delta E00 that fed the statistics.
     scans = repeat_payload(TARGET, 4, noise=0.0)
     body = post({
         "target": {"scans": scans},
@@ -164,8 +168,10 @@ def test_identical_repeats_give_zero_with_positive_width_support():
         assert item["median_de00"] == 0.0
         assert item["q025_de00"] == 0.0 and item["q975_de00"] == 0.0
         assert item["ci95_width_de00"] == 0.0
-        assert item["effective_draws"] == 1
-    assert body["replicates"]["unique_pairs_sampled"] == 1
+        assert item["effective_draws"] == 500
+    assert body["replicates"] == {
+        "target_scans": 4, "sample_scans": 3, "possible_pairs": 12}
+    assert body["summary"]["effective_draws"] == 500
 
 
 def test_scans_with_different_wavelength_grids_are_aligned():
@@ -328,8 +334,52 @@ def test_unknown_illuminant_still_structured():
     find(issues, "illuminants[0].name", "unknown_illuminant")
 
 
-def test_single_and_batch_endpoints_unchanged():
-    # regression: the original single-review shape is untouched
+def test_dark_pair_uncertainty_uses_correct_linear_branch():
+    """Regression: the uncertainty entry shares xyz_to_lab_array, so dark
+    non-black scans must produce the correct low-L* distribution (the broken
+    kappa*t + 16/116 branch inflated L* by ~13)."""
+    import math
+    kappa = 24389.0 / 27.0
+    r_t, r_s = 0.004, 0.006
+
+    def flat_scans(r, seed):
+        rng = np.random.default_rng(seed)
+        return [spectrum(np.clip(
+            r + rng.normal(0, 2e-5, WL.size), 0, 1).tolist())
+            for _ in range(4)]
+
+    body = post({
+        "target": {"scans": flat_scans(r_t, 1)},
+        "sample": {"scans": flat_scans(r_s, 2)},
+        "illuminants": [{"name": "D65"}],
+        "tolerance_de00": 50.0,
+        "seed": 0, "draws": 2000,
+    }).json()
+    item = body["results_by_illuminant"][0]
+    l1, l2 = kappa * r_t, kappa * r_s
+    l_bar = 0.5 * (l1 + l2)
+    s_l = 1.0 + 0.015 * (l_bar - 50.0) ** 2 / math.sqrt(
+        20.0 + (l_bar - 50.0) ** 2)
+    expected = abs(l2 - l1) / s_l
+    # tight agreement with the closed-form oracle; the broken
+    # kappa*t + 16/116 branch shifted this pair by ~0.18
+    assert item["median_de00"] == pytest.approx(expected, abs=5e-3)
+    assert item["effective_draws"] == 2000
+
+
+def test_effective_draws_counts_finite_samples_per_illuminant():
+    # With valid inputs every draw is finite: effective_draws equals draws for
+    # every illuminant, regardless of how few distinct scans/pairings exist.
+    body = post(uncertainty_payload(n_target=2, n_sample=2, draws=777)).json()
+    for item in body["results_by_illuminant"]:
+        assert item["effective_draws"] == 777
+    assert body["summary"]["effective_draws"] == 777
+    # pair combinatorics are reported separately, not as effective_draws
+    assert body["replicates"]["possible_pairs"] == 4
+    assert "unique_pairs_sampled" not in body["replicates"]
+
+
+def test_single_and_batch_endpoints_unchanged():    # regression: the original single-review shape is untouched
     r = client.post("/api/v1/review", json={
         "target": spectrum(TARGET),
         "sample": spectrum(METAMER),
