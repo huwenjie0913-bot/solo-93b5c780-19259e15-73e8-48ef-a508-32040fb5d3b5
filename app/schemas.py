@@ -53,6 +53,54 @@ class ReviewRequest(BaseModel):
     top_bands: int = Field(3, ge=1, le=20)
 
 
+class RepeatedSpectra(BaseModel):
+    """2-50 repeat scans of the same specimen.
+
+    Each scan may use its own wavelength grid; the engine intersects them
+    onto a common grid before the Monte Carlo resampling.
+    """
+
+    scans: list[SpectrumInput] = Field(
+        ..., min_length=2, max_length=50,
+        description="Repeat reflectance scans of one specimen.",
+    )
+
+
+class UncertaintyReviewRequest(BaseModel):
+    target: RepeatedSpectra
+    sample: RepeatedSpectra
+    illuminants: list[IlluminantSpec] = Field(
+        default_factory=lambda: [
+            IlluminantSpec(name="D65"),
+            IlluminantSpec(name="A"),
+            IlluminantSpec(name="F11"),
+        ],
+        min_length=1,
+        max_length=8,
+    )
+    tolerance_de00: float = Field(
+        2.0, gt=0, le=50,
+        description="CIEDE2000 pass threshold; samples at/under it pass.",
+    )
+    grid_step_nm: float = Field(10.0, ge=5, le=20)
+    seed: int = Field(
+        42, ge=0, le=2_147_483_647,
+        description="Base seed for the reproducible bootstrap RNG.",
+    )
+    draws: int = Field(
+        2000, ge=100, le=200_000,
+        description="Number of paired target/sample bootstrap draws.",
+    )
+    critical_probability_bound: float = Field(
+        0.05, gt=0.0, lt=0.5,
+        description=(
+            "If P(ΔE00 > threshold) is at or below this bound the pair is "
+            "'stable_pass'; at or above 1-bound it is 'stable_fail'; "
+            "otherwise 'critical'."
+        ),
+    )
+
+
 class BatchReviewRequest(BaseModel):
     target: SpectrumInput
     samples: list[NamedSample] = Field(..., min_length=1, max_length=100)

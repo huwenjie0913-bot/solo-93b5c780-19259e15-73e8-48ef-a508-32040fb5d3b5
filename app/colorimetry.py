@@ -133,28 +133,54 @@ def d65_white_xyz() -> tuple[float, float, float]:
     return (100.0 * x / y, 100.0, 100.0 * (1.0 - x - y) / y)
 
 
+def _f_lab(t):
+    eps = 216.0 / 24389.0
+    kappa = 24389.0 / 27.0
+    t = np.asarray(t, dtype=float)
+    linear = kappa * t + 16.0 / 116.0
+    cube = np.cbrt(np.maximum(t, 0.0))
+    return np.where(t > eps, cube, linear)
+
+
+def xyz_to_lab_array(xyz: np.ndarray,
+                     white: tuple[float, float, float] = d65_white_xyz()
+                     ) -> np.ndarray:
+    """Vectorised CIE XYZ -> CIE L*a*b*.
+
+    *xyz* has shape (..., 3); returns an array of the same shape with
+    L/a/b in the last axis.
+    """
+    xyz = np.asarray(xyz, dtype=float)
+    w = np.asarray(white, dtype=float)
+    ratio = xyz / w
+    f = _f_lab(ratio)
+    lab = np.stack([
+        116.0 * f[..., 1] - 16.0,
+        500.0 * (f[..., 0] - f[..., 1]),
+        200.0 * (f[..., 1] - f[..., 2]),
+    ], axis=-1)
+    return lab
+
+
 def xyz_to_lab(xyz: np.ndarray,
                white: tuple[float, float, float] = d65_white_xyz()) -> LabColor:
     """CIE XYZ -> CIE L*a*b* (D65 reference white by default)."""
-    eps = 216.0 / 24389.0
-    kappa = 24389.0 / 27.0
-    xr = xyz[0] / white[0]
-    yr = xyz[1] / white[1]
-    zr = xyz[2] / white[2]
-
-    def f(t: float) -> float:
-        return t ** (1.0 / 3.0) if t > eps else (kappa * t + 16.0) / 116.0
-
-    fx, fy, fz = f(xr), f(yr), f(zr)
-    return LabColor(L=116.0 * fy - 16.0, a=500.0 * (fx - fy), b=200.0 * (fy - fz))
+    lab = xyz_to_lab_array(xyz, white)
+    return LabColor(L=float(lab[0]), a=float(lab[1]), b=float(lab[2]))
 
 
-def ciede2000(lab1: LabColor, lab2: LabColor,
-              k_l: float = 1.0, k_c: float = 1.0,
-              k_h: float = 1.0) -> float:
-    """CIEDE2000 colour difference (Sharma, Wu, Dalal 2005 formulation)."""
-    l1, a1, b1 = lab1.L, lab1.a, lab1.b
-    l2, a2, b2 = lab2.L, lab2.a, lab2.b
+def ciede2000_array(lab1: np.ndarray, lab2: np.ndarray,
+                    k_l: float = 1.0, k_c: float = 1.0,
+                    k_h: float = 1.0) -> np.ndarray:
+    """Vectorised CIEDE2000 (Sharma, Wu, Dalal 2005 formulation).
+
+    *lab1*, *lab2* have shape (..., 3) with L/a/b in the last axis;
+    broadcasting is supported. Returns an array of ΔE00 values.
+    """
+    lab1 = np.asarray(lab1, dtype=float)
+    lab2 = np.asarray(lab2, dtype=float)
+    l1, a1, b1 = lab1[..., 0], lab1[..., 1], lab1[..., 2]
+    l2, a2, b2 = lab2[..., 0], lab2[..., 1], lab2[..., 2]
 
     c1 = np.hypot(a1, b1)
     c2 = np.hypot(a2, b2)
@@ -172,14 +198,15 @@ def ciede2000(lab1: LabColor, lab2: LabColor,
     dlp = l2 - l1
     dcp = c2p - c1p
 
-    if c1p * c2p == 0.0:
-        dhp = 0.0
-    elif abs(h2p - h1p) <= 180.0:
-        dhp = h2p - h1p
-    elif h2p - h1p > 180.0:
-        dhp = h2p - h1p - 360.0
-    else:
-        dhp = h2p - h1p + 360.0
+    prod = c1p * c2p
+    dhp = np.zeros_like(prod)
+    dhp = np.where(prod == 0.0, 0.0, dhp)
+    cond_gt = (h2p - h1p) > 180.0
+    cond_lt = (h2p - h1p) < -180.0
+    delta_h = h2p - h1p
+    dhp = np.where((prod != 0.0) & cond_gt, delta_h - 360.0, dhp)
+    dhp = np.where((prod != 0.0) & cond_lt, delta_h + 360.0, dhp)
+    dhp = np.where((prod != 0.0) & ~(cond_gt | cond_lt), delta_h, dhp)
 
     dhp_rad = np.radians(dhp)
     d_hp = 2.0 * np.sqrt(c1p * c2p) * np.sin(dhp_rad / 2.0)
@@ -187,14 +214,13 @@ def ciede2000(lab1: LabColor, lab2: LabColor,
     l_bar_p = 0.5 * (l1 + l2)
     c_bar_p = 0.5 * (c1p + c2p)
 
-    if c1p * c2p == 0.0:
-        h_bar_p = h1p + h2p
-    elif abs(h1p - h2p) <= 180.0:
-        h_bar_p = 0.5 * (h1p + h2p)
-    elif h1p + h2p < 360.0:
-        h_bar_p = 0.5 * (h1p + h2p + 360.0)
-    else:
-        h_bar_p = 0.5 * (h1p + h2p - 360.0)
+    h_sum = h1p + h2p
+    h_abs = np.abs(h1p - h2p)
+    h_bar_p = np.where(prod == 0.0, h_sum,
+                       np.where(h_abs <= 180.0, 0.5 * h_sum,
+                                np.where(h_sum < 360.0,
+                                         0.5 * (h_sum + 360.0),
+                                         0.5 * (h_sum - 360.0))))
 
     t = (1.0
          - 0.17 * np.cos(np.radians(h_bar_p - 30.0))
@@ -215,7 +241,18 @@ def ciede2000(lab1: LabColor, lab2: LabColor,
     term_l = dlp / (k_l * s_l)
     term_c = dcp / (k_c * s_c)
     term_h = d_hp / (k_h * s_h)
-    return float(np.sqrt(
-        term_l ** 2 + term_c ** 2 + term_h ** 2
-        + r_t * term_c * term_h
-    ))
+    radicand = (term_l ** 2 + term_c ** 2 + term_h ** 2
+                + r_t * term_c * term_h)
+    return np.sqrt(np.maximum(radicand, 0.0))
+
+
+def ciede2000(lab1: LabColor, lab2: LabColor,
+              k_l: float = 1.0, k_c: float = 1.0,
+              k_h: float = 1.0) -> float:
+    """CIEDE2000 colour difference (Sharma, Wu, Dalal 2005 formulation)."""
+    de = ciede2000_array(
+        np.array([[lab1.L, lab1.a, lab1.b]]),
+        np.array([[lab2.L, lab2.a, lab2.b]]),
+        k_l, k_c, k_h,
+    )
+    return float(de[0])

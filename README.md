@@ -11,7 +11,10 @@
 3. 内置 **D65 / A / F11**，也支持上传任意相对功率分布 (SPD)；
 4. 当某光源 ΔE00 ≤ 阈值而另一光源超差时，标记 **同色异谱风险**；
 5. 列出对 XYZ 色差贡献最大的**波长波段**（可配置 20–100 nm 聚合宽度）；
-6. 批量接口对多个试样**按阈值筛选、排序候选**。
+6. 批量接口对多个试样**按阈值筛选、排序候选**；
+7. `/review/uncertainty` 接收目标样/试样各 2–50 条**重复扫描**，用可复现的
+   自助法（bootstrap）蒙特卡洛给出 ΔE00 的中位数、2.5%/97.5% 分位数、
+   超阈概率，并判定“稳定合格 / 临界 / 稳定超差”。
 
 ## 色度学口径
 
@@ -57,6 +60,7 @@ python3 -m venv .venv
 | GET  | `/illuminants` | 内置光源目录与覆盖范围 |
 | POST | `/api/v1/review` | 单对目标样/试样，多光源复核 |
 | POST | `/api/v1/review/batch` | 一个目标样 + 多个试样，筛选/排序 |
+| POST | `/api/v1/review/uncertainty` | 重复扫描自助法：ΔE00 分布、超阈概率、稳定/临界判定 |
 
 ### 请求体关键字段
 
@@ -116,6 +120,71 @@ curl -s http://127.0.0.1:8000/api/v1/review/batch \
 `only_metameric=true` 只保留有同色异谱风险的试样，或
 `only_passing_all=true` 只保留全光源合格者。
 
+### 重复测量不确定性：`/api/v1/review/uncertainty`
+
+ΔE00 靠近容差线时，重复测量的波动会让同一批次时而合格、时而超差。
+本接口要求目标样与试样各提交 **2–50 条重复反射率扫描**（每条允许使用
+不同波长网格），计算流程：
+
+1. 取所有扫描（及自定义光源）波长支撑的**共同区间**，插值到统一网格；
+2. 每次蒙特卡洛抽样分别从目标样、试样的完整扫描中**有放回抽取整条
+   光谱**——整条抽取保留了同一次扫描内各波长之间的相关性；
+3. 同一组配对抽样在所有光源下复用，因此“任一光源超差”的概率是在
+   联合事件上统计的，光源间的超差事件保持相关；
+4. 逐光源计算每次抽样的 XYZ（沿用梯形积分、各光源自适应白点、
+   CIEDE2000），得到 ΔE00 分布。
+
+请求参数：
+
+- `target.scans` / `sample.scans`：`SpectrumInput` 数组，长度 2–50；
+- `seed`（0–2³¹−1，默认 42）与 `draws`（100–200000，默认 2000）：
+  相同 `seed` + 相同输入得到逐位一致的可复现结果；
+- `critical_probability_bound`：判定概率界限 α（0 < α < 0.5，默认 0.05）。
+
+判定规则（设 P = P(ΔE00 > 阈值)）：
+
+| 分类 | 条件 | 含义 |
+|------|------|------|
+| `stable_pass`（稳定合格） | P ≤ α | 95% 区间整体在容差线内侧 |
+| `critical`（临界） | α < P < 1−α | 结果跨容差线，建议复测 |
+| `stable_fail`（稳定超差） | P ≥ 1−α | 95% 区间整体在容差线外侧 |
+
+```bash
+curl -s http://127.0.0.1:8000/api/v1/review/uncertainty \
+  -H 'Content-Type: application/json' \
+  -d @examples/uncertainty_request.json | python3 -m json.tool
+```
+
+响应逐光源返回 `median_de00`、`q025_de00`、`q975_de00`、
+`ci95_width_de00`、`probability_over_tolerance`、`classification` 与
+`effective_draws`（实际抽到的不同“目标扫描内容×试样扫描内容”配对数；
+提交完全相同的重复扫描时该数会下降）。`summary` 汇总：
+
+```jsonc
+{
+  "replicates": {"target_scans": 6, "sample_scans": 5,
+                 "possible_pairs": 30, "unique_pairs_sampled": 30},
+  "results_by_illuminant": [
+    {"illuminant": "D65", "median_de00": 0.6381,
+     "q025_de00": 0.1158, "q975_de00": 1.6191,
+     "probability_over_tolerance": 0.2372, "classification": "critical", ...},
+    {"illuminant": "A",   "median_de00": 2.8675,
+     "probability_over_tolerance": 1.0, "classification": "stable_fail", ...},
+    {"illuminant": "F11", "median_de00": 1.4333,
+     "probability_over_tolerance": 0.8972, "classification": "critical", ...}
+  ],
+  "summary": {
+    "probability_over_tolerance_any_illuminant": 1.0,
+    "classification_any": "stable_fail",
+    "least_stable_illuminant": "F11",
+    "least_stable_ci95_width_de00": 1.7161
+  }
+}
+```
+
+“最不稳定光源”取 95% 区间宽度最大的光源；分块计算保证
+`draws=200000` 时内存占用仍有上界（约数十 MB）。
+
 ## 错误处理（HTTP 422）
 
 所有数据问题一次性收集返回，每条错误都带 `field` / `code` / `reason`，
@@ -149,6 +218,6 @@ app/
   main.py            # FastAPI 路由与 422 归一化
   data/              # 打包的 CIE 1931 CMF 与 A/D65/F11 SPD（离线）
 scripts/build_data.py
-tests/               # CIEDE2000 标准数据 + 26 项单元/接口/对拍测试
-examples/            # curl 示例请求
+tests/               # CIEDE2000 标准数据 + 单元/接口/对拍/不确定性测试
+examples/            # curl 示例请求（含 uncertainty_request.json）
 ```

@@ -11,12 +11,14 @@ from .colorimetry import (
     WL_MAX,
     WL_MIN,
     ciede2000,
+    ciede2000_array,
     cmf_on_grid,
     illuminant_on_grid,
     interp_linear,
     make_grid,
     tristimulus,
     xyz_to_lab,
+    xyz_to_lab_array,
 )
 from .validation import (
     RequestValidationError,
@@ -180,10 +182,17 @@ def _common_support_range(target: Spectrum, sample: Spectrum,
                           step_nm: float) -> tuple[float, float]:
     """Intersection of every input series' measured wavelength support,
     snapped outward to regular grid nodes inside 380-780 nm."""
-    lo = max(float(target.wavelengths.min()),
-             float(sample.wavelengths.min()))
-    hi = min(float(target.wavelengths.max()),
-             float(sample.wavelengths.max()))
+    return _common_support_range_multi([target, sample], illuminants, step_nm)
+
+
+def _common_support_range_multi(
+        spectra: list[Spectrum],
+        illuminants: list[IlluminantInput],
+        step_nm: float) -> tuple[float, float]:
+    """Like ``_common_support_range`` but for arbitrary reflectance series
+    (e.g. every repeat scan of a target/sample specimen)."""
+    lo = max(float(sp.wavelengths.min()) for sp in spectra)
+    hi = min(float(sp.wavelengths.max()) for sp in spectra)
     for ill in illuminants:
         if ill.kind == "custom":
             lo = max(lo, float(ill.spectrum.wavelengths.min()))
@@ -198,7 +207,7 @@ def _common_support_range(target: Spectrum, sample: Spectrum,
             "field": "wavelength_range_nm",
             "code": "insufficient_overlap",
             "reason": (
-                "the target, sample and custom illuminants do not share enough "
+                "the submitted spectra and custom illuminants do not share enough "
                 f"overlapping wavelength support for a {step_nm:g} nm grid "
                 f"(intersection is [{lo:g}, {hi:g}] nm)"
             ),
@@ -307,4 +316,181 @@ def evaluate_pair(target: Spectrum, sample: Spectrum,
         "max_de00": worst["delta_e00"],
         "mean_de00": round(float(np.mean([r["delta_e00"] for r in per_ill])), 4),
         "pass_all": all(pass_flags),
+    }
+
+
+def _trapz_weights(grid: np.ndarray) -> np.ndarray:
+    """Node weights of the composite trapezoidal rule on *grid*."""
+    gaps = np.diff(grid)
+    weights = np.zeros(grid.size, dtype=float)
+    weights[:-1] += 0.5 * gaps
+    weights[1:] += 0.5 * gaps
+    return weights
+
+
+def _align_repeats(scans: list[Spectrum], grid: np.ndarray) -> np.ndarray:
+    """Interpret-clip each repeat scan onto the common grid.
+
+    Returns an (n_scans, n_grid) reflectance matrix; each complete scan is
+    kept intact so within-scan wavelength correlation is preserved.
+    """
+    return np.vstack([align_reflectance(sp, grid) for sp in scans])
+
+
+def _classify(prob_over: float, bound: float) -> str:
+    """Stability class from the over-tolerance probability."""
+    if prob_over <= bound + 1e-12:
+        return "stable_pass"
+    if prob_over >= 1.0 - bound - 1e-12:
+        return "stable_fail"
+    return "critical"
+
+
+def evaluate_uncertainty(target_scans: list[Spectrum],
+                         sample_scans: list[Spectrum],
+                         illuminants: list[IlluminantInput],
+                         step_nm: float, tolerance: float,
+                         seed: int, draws: int,
+                         prob_bound: float,
+                         wl_min: float = WL_MIN,
+                         wl_max: float = WL_MAX) -> dict:
+    """Bootstrap uncertainty of ΔE00 from repeated reflectance scans.
+
+    Each Monte Carlo draw resamples *whole* target and sample scans with
+    replacement (one index per specimen), preserving the inter-wavelength
+    correlation inside a scan. The same paired draws are reused for every
+    illuminant.
+    """
+    grid_issues = validate_grid(step_nm, wl_min, wl_max)
+    if grid_issues:
+        raise RequestValidationError(grid_issues)
+
+    n_target = len(target_scans)
+    n_sample = len(sample_scans)
+
+    # Intersect the wavelength support of every repeat scan (scans may use
+    # different grids) and every custom illuminant.
+    wl_min, wl_max = _common_support_range_multi(
+        [*target_scans, *sample_scans], illuminants, step_nm)
+    grid = make_grid(step_nm, wl_min, wl_max)
+    n_grid = grid.size
+
+    r_target = _align_repeats(target_scans, grid)   # (n_target, n_grid)
+    r_sample = _align_repeats(sample_scans, grid)   # (n_sample, n_grid)
+
+    # One resampling stream per specimen; the target indices do not depend on
+    # the illuminant, so over-tolerance events stay correlated across lights.
+    rng = np.random.default_rng(seed)
+    idx_t = rng.integers(0, n_target, size=draws)
+    idx_s = rng.integers(0, n_sample, size=draws)
+    # Effective number of distinct bootstrap outcomes actually drawn: collapse
+    # scan indices that carry the same aligned reflectance (e.g. submitted
+    # duplicate scans), then count distinct (target, sample) content pairs.
+    _, content_t = np.unique(r_target, axis=0, return_inverse=True)
+    _, content_s = np.unique(r_sample, axis=0, return_inverse=True)
+    pair_codes = content_t[idx_t].astype(np.int64) * (n_sample + 1) \
+        + content_s[idx_s]
+    effective_draws = int(np.unique(pair_codes).size)
+
+    x_bar, y_bar, z_bar = cmf_on_grid(grid)
+    w = _trapz_weights(grid)
+
+    # Precompute one integration kernel per (illuminant, CMF channel), so a
+    # draw reduces to a matrix-vector product and the Monte Carlo can run in
+    # bounded-memory chunks even for the maximum number of draws.
+    chunk_size = 20_000
+    kernels: list[tuple[np.ndarray, np.ndarray, np.ndarray, tuple]] = []
+    for ill in illuminants:
+        if ill.kind == "builtin":
+            power = illuminant_on_grid(ill.ref_name, grid)
+        else:
+            power = interp_linear(ill.spectrum.wavelengths,
+                                  ill.spectrum.values, grid)
+        denom = float(np.sum(power * y_bar * w))
+        if denom <= 0.0:
+            raise RequestValidationError([{
+                "field": f"illuminants:{ill.key}",
+                "code": "zero_normalisation_denominator",
+                "reason": (
+                    "normalisation denominator integral "
+                    f"S(lambda)y_bar(lambda) is zero for illuminant "
+                    f"{ill.display_name!r}; the SPD must emit within the "
+                    "visible (especially 450-650 nm) range"
+                ),
+            }])
+        scale = 100.0 / denom
+        white = (float(scale * np.sum(power * x_bar * w)),
+                 float(scale * np.sum(power * y_bar * w)),
+                 float(scale * np.sum(power * z_bar * w)))
+        kernels.append((scale * power * x_bar * w,
+                        scale * power * y_bar * w,
+                        scale * power * z_bar * w,
+                        white))
+
+    de_by_ill = [np.empty(draws, dtype=float) for _ in illuminants]
+    any_over = np.zeros(draws, dtype=bool)
+
+    for start in range(0, draws, chunk_size):
+        stop = min(start + chunk_size, draws)
+        chunk_target = r_target[idx_t[start:stop]]   # (chunk, n_grid)
+        chunk_sample = r_sample[idx_s[start:stop]]
+        for j, (kx, ky, kz, white) in enumerate(kernels):
+            xyz_t = np.column_stack([
+                chunk_target @ kx, chunk_target @ ky, chunk_target @ kz])
+            xyz_s = np.column_stack([
+                chunk_sample @ kx, chunk_sample @ ky, chunk_sample @ kz])
+            # Adaptive white: perfect reflector under this very SPD.
+            lab_t = xyz_to_lab_array(xyz_t, white)
+            lab_s = xyz_to_lab_array(xyz_s, white)
+            de_chunk = ciede2000_array(lab_t, lab_s)
+            de_by_ill[j][start:stop] = de_chunk
+            any_over[start:stop] |= de_chunk > tolerance + 1e-9
+
+    per_ill: list[dict] = []
+    for ill, de in zip(illuminants, de_by_ill):
+        q025, median, q975 = (float(v) for v in np.quantile(
+            de, (0.025, 0.5, 0.975), method="linear"))
+        prob_over = float(np.count_nonzero(de > tolerance + 1e-9)) / draws
+        q025_r, median_r, q975_r = (round(v, 4) for v in (q025, median, q975))
+
+        per_ill.append({
+            "illuminant": ill.key,
+            "illuminant_label": ill.display_name,
+            "kind": ill.kind,
+            "median_de00": median_r,
+            "q025_de00": q025_r,
+            "q975_de00": q975_r,
+            "ci95_width_de00": round(q975_r - q025_r, 4),
+            "probability_over_tolerance": round(prob_over, 6),
+            "classification": _classify(prob_over, prob_bound),
+            "effective_draws": effective_draws,
+            "tolerance_de00": tolerance,
+        })
+
+    # The least stable light: widest Monte Carlo 95% interval (first wins ties).
+    least = max(range(len(per_ill)),
+                key=lambda i: per_ill[i]["ci95_width_de00"])
+    prob_any_over = float(np.count_nonzero(any_over)) / draws
+
+    return {
+        "grid_nm": list(grid),
+        "grid_step_nm": step_nm,
+        "seed": seed,
+        "draws": draws,
+        "tolerance_de00": tolerance,
+        "critical_probability_bound": prob_bound,
+        "replicates": {
+            "target_scans": n_target,
+            "sample_scans": n_sample,
+            "possible_pairs": n_target * n_sample,
+            "unique_pairs_sampled": effective_draws,
+        },
+        "results_by_illuminant": per_ill,
+        "summary": {
+            "probability_over_tolerance_any_illuminant": round(prob_any_over, 6),
+            "classification_any": _classify(prob_any_over, prob_bound),
+            "least_stable_illuminant": per_ill[least]["illuminant"],
+            "least_stable_illuminant_label": per_ill[least]["illuminant_label"],
+            "least_stable_ci95_width_de00": per_ill[least]["ci95_width_de00"],
+        },
     }

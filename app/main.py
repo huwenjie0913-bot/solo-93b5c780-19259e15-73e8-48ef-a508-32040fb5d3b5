@@ -6,6 +6,7 @@ GET  /health
 GET  /illuminants                 built-in illuminant catalogue
 POST /api/v1/review               single target/sample pair, many illuminants
 POST /api/v1/review/batch         one target, many samples; filter + sort
+POST /api/v1/review/uncertainty   repeat-scan bootstrap of Delta E00 uncertainty
 """
 from __future__ import annotations
 
@@ -15,8 +16,12 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from .colorimetry import BUILTIN_ILLUMINANTS, WL_MAX, WL_MIN, illuminant_table
-from .engine import evaluate_pair, resolve_illuminants
-from .schemas import BatchReviewRequest, ReviewRequest
+from .engine import evaluate_pair, evaluate_uncertainty, resolve_illuminants
+from .schemas import (
+    BatchReviewRequest,
+    ReviewRequest,
+    UncertaintyReviewRequest,
+)
 from .validation import (
     RequestValidationError,
     parse_spectrum,
@@ -140,6 +145,58 @@ async def review(req: ReviewRequest):
         "grid_step_nm": req.grid_step_nm,
         **result,
     }
+
+
+@app.post("/api/v1/review/uncertainty")
+async def review_uncertainty(req: UncertaintyReviewRequest):
+    issues: list[dict] = []
+
+    target_scans = []
+    for i, scan in enumerate(req.target.scans):
+        sp = parse_spectrum(
+            scan.model_dump(), f"target.scans[{i}]", f"target[{i}]",
+            is_reflectance=True, issues=issues,
+        )
+        if sp is not None:
+            target_scans.append(sp)
+    sample_scans = []
+    for i, scan in enumerate(req.sample.scans):
+        sp = parse_spectrum(
+            scan.model_dump(), f"sample.scans[{i}]", f"sample[{i}]",
+            is_reflectance=True, issues=issues,
+        )
+        if sp is not None:
+            sample_scans.append(sp)
+
+    try:
+        illuminants = resolve_illuminants(req.illuminants, "illuminants")
+    except RequestValidationError as exc:
+        issues.extend(exc.issues)
+
+    if not target_scans:
+        issues.append({
+            "field": "target.scans",
+            "code": "no_valid_scan",
+            "reason": "at least one valid target reflectance scan is required",
+        })
+    if not sample_scans:
+        issues.append({
+            "field": "sample.scans",
+            "code": "no_valid_scan",
+            "reason": "at least one valid sample reflectance scan is required",
+        })
+
+    if issues:
+        raise RequestValidationError(issues)
+
+    return evaluate_uncertainty(
+        target_scans, sample_scans, illuminants,
+        step_nm=req.grid_step_nm,
+        tolerance=req.tolerance_de00,
+        seed=req.seed,
+        draws=req.draws,
+        prob_bound=req.critical_probability_bound,
+    )
 
 
 @app.post("/api/v1/review/batch")
